@@ -97,7 +97,3 @@ query = (spark.readStream
 # COMMAND ----------
 
 display(spark.table(table_test_name))
-
-# COMMAND ----------
-
-

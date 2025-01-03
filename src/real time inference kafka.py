@@ -17,7 +17,7 @@ import uuid
 model_serving_endpoint_name = "test_wine_mode_endpoint"
 
 # Datasets
-model_inference_input_table = "prod.default.model_inference_test"
+test_source_table = "prod.default.model_inference_test"
 model_inference_output_table = "prod.default.model_inference_test_result"
 
 # Kafka connection info
@@ -31,14 +31,7 @@ target_topic = ""
 # Streaming variables
 username = dbutils.notebook.entry_point.getDbutils().notebook().getContext().userName().get()
 project_dir = f"/home/{username}/kafka_test"
-checkpoint_kafka_load_source_location = f"{project_dir}/kafka_load_source"
-checkpoint_kafka_sync_location = f"{project_dir}/kafka_sync"
-
-# COMMAND ----------
-
-# Clear checkpoint location so that every time this notebook runs, there will be new data to be processed by the streaming jobs
-dbutils.fs.rm(checkpoint_kafka_load_source_location, True)
-#dbutils.fs.rm(checkpoint_kafka_sync_location, True)
+checkpoint_kafka_sync_location = f"{project_dir}/kafka_sync/{target_topic}"
 
 # COMMAND ----------
 
@@ -48,10 +41,11 @@ dbutils.fs.rm(checkpoint_kafka_load_source_location, True)
 # COMMAND ----------
 
 uuidUdf= udf(lambda : uuid.uuid4().hex,StringType())
+schema = spark.table(test_source_table).schema
 
 # Load test data
-load_data_df = spark.readStream \
-                  .table(model_inference_input_table) \
+load_data_df = spark.read \
+                  .table(test_source_table) \
                   .withColumn("processingTime", lit(datetime.now().timestamp()).cast("timestamp")) \
                   .withColumn("eventId", uuidUdf()) \
                   .select(col("eventId").alias("key"), to_json(struct(col('fixed_acidity'), 
@@ -71,18 +65,14 @@ load_data_df = spark.readStream \
 # COMMAND ----------
 
 # Write test data to a Kafka topic
-st_1 = load_data_df.writeStream \
+load_data_df.write \
     .format("kafka") \
     .option("kafka.bootstrap.servers", kafka_bootstrap_server ) \
     .option("kafka.sasl.mechanism", sasl_mechanisms) \
     .option("kafka.security.protocol", security_protocol) \
     .option("kafka.sasl.jaas.config", sasl_jaas_config) \
-    .option("checkpointLocation", checkpoint_kafka_load_source_location ) \
     .option("topic", source_topic) \
-    .trigger(availableNow=True) \
-    .start()
-
-st_1.awaitTermination()
+    .save()
 
 # COMMAND ----------
 
@@ -136,9 +126,7 @@ def batch_inference(batch_df, batch_id):
 
 # COMMAND ----------
 
-schema = spark.table(model_inference_input_table).schema
-
-st_2 = spark.readStream \
+spark.readStream \
   .format("kafka") \
   .option("kafka.bootstrap.servers", kafka_bootstrap_server ) \
   .option("kafka.sasl.mechanism", sasl_mechanisms) \
@@ -153,10 +141,5 @@ st_2 = spark.readStream \
   .option("checkpointLocation", checkpoint_kafka_sync_location ) \
   .foreachBatch(batch_inference) \
   .trigger(availableNow=True) \
-  .start()
-
-st_2.awaitTermination()
-
-# COMMAND ----------
-
-
+  .start() \
+  .awaitTermination()

@@ -14,11 +14,11 @@ import uuid
 # COMMAND ----------
 
 # Model Serving Endpoint
-model_serving_endpoint_name = "test_wine_mode_endpoint"
+model_serving_endpoint_name = ""
 
 # Datasets
-test_source_table = "prod.default.model_inference_test"
-model_inference_output_table = "prod.default.model_inference_test_result"
+test_source_table = "" # Table containing the test data to be fed to Kafka to simulate source records 
+model_inference_output_table = "" # Delta table where the real-time inference output will be written to
 
 # Kafka connection info
 kafka_bootstrap_server = ""
@@ -31,7 +31,8 @@ target_topic = ""
 # Streaming variables
 username = dbutils.notebook.entry_point.getDbutils().notebook().getContext().userName().get()
 project_dir = f"/home/{username}/kafka_test"
-checkpoint_kafka_sync_location = f"{project_dir}/kafka_sync/{target_topic}"
+checkpoint_kafka_delta_sync = f"{project_dir}/kafka_delta_sync/{target_topic}"
+checkpoint_delta_kafka_sync = f"{project_dir}/delta_kafka_sync/{target_topic}"
 
 # COMMAND ----------
 
@@ -77,7 +78,12 @@ load_data_df.write \
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # Reads from Kafka and writes to different targets
+# MAGIC # Scoring using model a serving endpoint
+# MAGIC
+# MAGIC - If you need to write the output of a streaming query to multiple locations, Databricks recommends using multiple Structured Streaming writers for best parallelization and throughput. In this case, the first streaming to writes to delta, and the second streaming writes to kafka.
+# MAGIC
+# MAGIC See https://learn.microsoft.com/en-us/azure/databricks/structured-streaming/foreach#write-to-multiple-locations
+# MAGIC
 
 # COMMAND ----------
 
@@ -90,14 +96,36 @@ def batch_inference(batch_df, batch_id):
   response = w.serving_endpoints.query(name = model_serving_endpoint_name, dataframe_split = dataframe_split)
   batch_df_pd["good_quality_prediction"] = ["yes" if b else "no" for b in response.predictions]
 
-  # Convert from pandas to Spark
-  spark_df = spark.createDataFrame(batch_df_pd)
-
   # Write to Delta
-  spark_df.withColumn("batch_id", lit(batch_id)).write.mode("append").saveAsTable(model_inference_output_table)
+  spark.createDataFrame(batch_df_pd).withColumn("batch_id", lit(batch_id)).write.mode("append").saveAsTable(model_inference_output_table)
 
-  # Write to Kafka
-  spark_df \
+# COMMAND ----------
+
+# Read from Kafka and Write to Delta
+spark.readStream \
+  .format("kafka") \
+  .option("kafka.bootstrap.servers", kafka_bootstrap_server ) \
+  .option("kafka.sasl.mechanism", sasl_mechanisms) \
+  .option("kafka.security.protocol", security_protocol) \
+  .option("kafka.sasl.jaas.config", sasl_jaas_config) \
+  .option("subscribe", source_topic ) \
+  .option("startingOffsets", "earliest" ) \
+  .load() \
+  .select(from_json(col("value").cast("string"), schema).alias("data")) \
+  .select("data.*") \
+  .writeStream \
+  .queryName("read_kafka_write_delta") \
+  .option("checkpointLocation", checkpoint_kafka_delta_sync ) \
+  .foreachBatch(batch_inference) \
+  .trigger(availableNow=True) \
+  .start() \
+  .awaitTermination()
+
+# COMMAND ----------
+
+# Read from Delta and Write to Kafka
+spark.readStream \
+      .table(model_inference_output_table) \
       .withColumn("processingTime", lit(datetime.now().timestamp()).cast("timestamp")) \
       .withColumn("eventId", uuidUdf()) \
       .select(col("eventId").alias("key"), to_json(struct(col('fixed_acidity'), 
@@ -114,32 +142,15 @@ def batch_inference(batch_df, batch_id):
                                                           col('is_red'), 
                                                           col('good_quality_prediction'), 
                                                           col('processingTime'))).alias("value")) \
-      .write \
+      .writeStream \
+      .queryName("read_delta_write_kafka") \
       .format("kafka") \
       .option("kafka.bootstrap.servers", kafka_bootstrap_server ) \
       .option("kafka.sasl.mechanism", sasl_mechanisms) \
       .option("kafka.security.protocol", security_protocol) \
       .option("kafka.sasl.jaas.config", sasl_jaas_config) \
       .option("topic", target_topic) \
-      .save()
-
-
-# COMMAND ----------
-
-spark.readStream \
-  .format("kafka") \
-  .option("kafka.bootstrap.servers", kafka_bootstrap_server ) \
-  .option("kafka.sasl.mechanism", sasl_mechanisms) \
-  .option("kafka.security.protocol", security_protocol) \
-  .option("kafka.sasl.jaas.config", sasl_jaas_config) \
-  .option("subscribe", source_topic ) \
-  .option("startingOffsets", "earliest" ) \
-  .load() \
-  .select(from_json(col("value").cast("string"), schema).alias("data")) \
-  .select("data.*") \
-  .writeStream \
-  .option("checkpointLocation", checkpoint_kafka_sync_location ) \
-  .foreachBatch(batch_inference) \
-  .trigger(availableNow=True) \
-  .start() \
-  .awaitTermination()
+      .option("checkpointLocation", checkpoint_delta_kafka_sync ) \
+      .trigger(availableNow=True) \
+      .start() \
+      .awaitTermination()
